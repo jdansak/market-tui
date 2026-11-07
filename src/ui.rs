@@ -74,7 +74,7 @@ fn draw_top_nav(f: &mut Frame, app: &App, area: Rect) {
         .border_type(BorderType::Rounded)
         .border_style(Style::default().fg(palette::INACTIVE_BORDER))
         .title(Line::from(vec![
-            Span::styled(" BLOOMBERG TERMINAL WORKSTATION ", Style::default().fg(palette::ACCENT).add_modifier(Modifier::BOLD)),
+            Span::styled(" MARKET TERMINAL ", Style::default().fg(palette::ACCENT).add_modifier(Modifier::BOLD)),
             Span::styled(" [Switch Tabs: 'w' or F1-F5] ", Style::default().fg(palette::TEXT_MUTED)),
         ]));
 

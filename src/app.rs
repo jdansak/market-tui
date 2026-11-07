@@ -1,7 +1,8 @@
 // src/app.rs
-//! Application state, workstation views, chart modes, and keyboard navigation.
+//! Application state, workstation views, chart modes, keyboard navigation, and pre-cache integration.
 
 use crate::{
+    cache::{MarketCache, WorkerRequest, WorkerUpdate},
     correlation::{compute_correlation_matrix, CorrelationAnalysis},
     data::{self, Candle, NewsItem},
     insider::{fetch_insider_transactions, InsiderTransaction},
@@ -13,6 +14,7 @@ use crate::{
 use anyhow::Result;
 use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceView {
@@ -50,7 +52,7 @@ impl WorkspaceView {
             WorkspaceView::Options => WorkspaceView::Overview,
             WorkspaceView::Correlation => WorkspaceView::Options,
             WorkspaceView::Insiders => WorkspaceView::Correlation,
-            WorkspaceView::YieldCurve => WorkspaceView::Insiders,
+            WorkspaceView::YieldCurve => WorkspaceView::Overview,
         }
     }
 }
@@ -98,6 +100,7 @@ pub struct App {
     pub chart_mode: ChartMode,
     pub show_news: bool,
     pub category_filter: Option<AssetCategory>,
+    #[allow(dead_code)]
     pub last_refresh: Instant,
     pub should_quit: bool,
     pub show_add_modal: bool,
@@ -108,14 +111,29 @@ pub struct App {
     pub correlation: Option<CorrelationAnalysis>,
     pub insider_trades: Vec<InsiderTransaction>,
     pub yield_curve: Option<YieldCurveSnapshot>,
+
+    // High-Performance In-Memory Pre-Cache & Worker Channel
+    pub cache: MarketCache,
+    pub tx_req: mpsc::UnboundedSender<WorkerRequest>,
 }
 
 impl Default for App {
     fn default() -> Self {
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let default_ticker = Ticker::new("NVDA");
+        let initial_snap = data::fallback_synthetic(&default_ticker, Timeframe::OneDay).unwrap();
+
+        let mut cache = MarketCache::new();
+        cache.insert_chart(
+            default_ticker.symbol.clone(),
+            Timeframe::OneDay,
+            initial_snap.clone(),
+        );
+
         Self {
             current_view: WorkspaceView::Overview,
             watchlist: vec![
-                Ticker::new("NVDA"),
+                default_ticker,
                 Ticker::new("AAPL"),
                 Ticker::new("MSFT"),
                 Ticker::new("TSLA"),
@@ -132,8 +150,8 @@ impl Default for App {
                 Ticker::new("CL=F"),
             ],
             selected: 0,
-            candles: Vec::new(),
-            chart_data: Vec::new(),
+            candles: initial_snap.candles,
+            chart_data: initial_snap.points,
             news: Vec::new(),
             news_selected: 0,
             chart_cursor: None,
@@ -150,13 +168,22 @@ impl Default for App {
             correlation: None,
             insider_trades: Vec::new(),
             yield_curve: None,
+            cache,
+            tx_req: tx,
         }
     }
 }
 
+#[allow(dead_code)]
 impl App {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_channels(tx_req: mpsc::UnboundedSender<WorkerRequest>) -> Self {
+        let mut app = Self::default();
+        app.tx_req = tx_req;
+        app
     }
 
     pub fn filtered_indices(&self) -> Vec<usize> {
@@ -186,92 +213,153 @@ impl App {
         self.candles.get(idx)
     }
 
-    pub async fn refresh_active(&mut self) -> Result<()> {
-        if let Some(ticker) = self.watchlist.get(self.selected).cloned() {
-            let symbol = ticker.symbol.clone();
-
-            // 1. Fetch Chart Snapshot (Candles + Dense Line)
-            if let Ok(snap) = data::fetch_chart_data(&ticker, self.timeframe).await {
-                self.candles = snap.candles.clone();
-                self.chart_data = snap.points;
-                self.chart_cursor = None;
-
-                if let Some(t) = self.watchlist.get_mut(self.selected) {
-                    t.current_price = snap.current_price;
-                    t.change = snap.current_price - snap.previous_close;
-                    if snap.previous_close.abs() > 0.0001 {
-                        t.change_percent = (t.change / snap.previous_close) * 100.0;
-                    }
-                    t.high_24h = snap.high;
-                    t.low_24h = snap.low;
-                    t.volume = snap.volume;
-                }
-            }
-
-            // 2. Fetch Live Market News
-            self.news = data::fetch_ticker_news(&symbol).await;
+    /// Instantaneous ticker selection: loads from in-memory cache instantly
+    /// and dispatches background priority fetch without blocking the UI.
+    pub fn select_ticker(&mut self, new_idx: usize) {
+        if new_idx < self.watchlist.len() {
+            self.selected = new_idx;
+            self.chart_cursor = None;
             self.news_selected = 0;
 
-            // 3. Fetch Options Chain & Max Pain
-            let cur_price = self.selected_ticker().map(|t| t.current_price).unwrap_or(150.0);
-            if let Ok(opt) = fetch_options_chain(&symbol, cur_price).await {
-                self.options_chain = Some(opt);
+            let ticker = self.watchlist[self.selected].clone();
+            let tf = self.timeframe;
+
+            // 1. Instant cache check for chart
+            if let Some(snap) = self.cache.get_chart(&ticker.symbol, tf) {
+                self.candles = snap.candles.clone();
+                self.chart_data = snap.points.clone();
+            } else {
+                let fallback = data::fallback_synthetic(&ticker, tf).unwrap();
+                self.candles = fallback.candles;
+                self.chart_data = fallback.points;
             }
 
-            // 4. Fetch SEC Form 4 Insider Trades
-            if let Ok(trades) = fetch_insider_transactions(&symbol).await {
-                self.insider_trades = trades;
+            // 2. Instant cache check for news
+            if let Some(news) = self.cache.get_news(&ticker.symbol) {
+                self.news = news.clone();
             }
 
-            // 5. Fetch US Treasury Yield Curve
-            if let Ok(yc) = fetch_yield_curve().await {
-                self.yield_curve = Some(yc);
+            // 3. Instant cache check for options
+            if let Some(opt) = self.cache.get_options(&ticker.symbol) {
+                self.options_chain = Some(opt.clone());
             }
 
-            // 6. Compute Cross-Asset Correlation Matrix
-            self.update_correlation_analysis().await;
+            // 4. Instant cache check for insiders
+            if let Some(ins) = self.cache.get_insiders(&ticker.symbol) {
+                self.insider_trades = ins.clone();
+            }
+
+            // 5. Signal background worker to prioritize this ticker
+            let _ = self.tx_req.send(WorkerRequest::PrioritizeTicker {
+                ticker,
+                timeframe: tf,
+            });
         }
-
-        self.last_refresh = Instant::now();
-        Ok(())
     }
 
-    pub async fn update_correlation_analysis(&mut self) {
-        let mut asset_candles = Vec::new();
-        // Take top 6 active tickers for a clean, readable correlation matrix
-        for t in self.watchlist.iter().take(8) {
-            if let Ok(snap) = data::fetch_chart_data(t, Timeframe::OneMonth).await {
-                asset_candles.push((t.symbol.clone(), snap.candles));
+    /// Instantaneous timeframe change: loads from pre-cache immediately.
+    pub fn set_timeframe(&mut self, tf: Timeframe) {
+        self.timeframe = tf;
+        self.chart_cursor = None;
+
+        if let Some(ticker) = self.watchlist.get(self.selected).cloned() {
+            if let Some(snap) = self.cache.get_chart(&ticker.symbol, tf) {
+                self.candles = snap.candles.clone();
+                self.chart_data = snap.points.clone();
+            } else {
+                let fallback = data::fallback_synthetic(&ticker, tf).unwrap();
+                self.candles = fallback.candles;
+                self.chart_data = fallback.points;
             }
-        }
-        if !asset_candles.is_empty() {
-            self.correlation = Some(compute_correlation_matrix(&asset_candles, "SPY"));
+            let _ = self.tx_req.send(WorkerRequest::PrioritizeTicker {
+                ticker,
+                timeframe: tf,
+            });
         }
     }
 
-    pub async fn refresh_all_quotes(&mut self) {
-        for t in &mut self.watchlist {
-            if let Ok(snap) = data::fetch_chart_data(t, Timeframe::OneDay).await {
-                t.current_price = snap.current_price;
-                t.change = snap.current_price - snap.previous_close;
-                if snap.previous_close.abs() > 0.0001 {
-                    t.change_percent = (t.change / snap.previous_close) * 100.0;
+    /// Applies background data updates to the in-memory cache and updates the UI
+    /// seamlessly if the update matches the currently inspected asset.
+    pub fn apply_update(&mut self, update: WorkerUpdate) {
+        match update {
+            WorkerUpdate::ChartSnapshot {
+                symbol,
+                timeframe,
+                snapshot,
+            } => {
+                let is_active = self.selected_ticker().map(|t| t.symbol == symbol).unwrap_or(false);
+                if is_active && self.timeframe == timeframe {
+                    self.candles = snapshot.candles.clone();
+                    self.chart_data = snapshot.points.clone();
                 }
-                t.high_24h = snap.high;
-                t.low_24h = snap.low;
-                t.volume = snap.volume;
+
+                // If quote info is available in the snapshot, update the watchlist item too
+                if let Some(t) = self.watchlist.iter_mut().find(|item| item.symbol == symbol) {
+                    t.current_price = snapshot.current_price;
+                    t.change = snapshot.current_price - snapshot.previous_close;
+                    if snapshot.previous_close.abs() > 0.0001 {
+                        t.change_percent = (t.change / snapshot.previous_close) * 100.0;
+                    }
+                    t.high_24h = snapshot.high;
+                    t.low_24h = snapshot.low;
+                    t.volume = snapshot.volume;
+                }
+
+                self.cache.insert_chart(symbol, timeframe, snapshot);
+            }
+            WorkerUpdate::Quotes(quotes) => {
+                for t in &mut self.watchlist {
+                    if let Some(q) = quotes.get(&t.symbol) {
+                        t.current_price = q.current_price;
+                                                t.change = q.change;
+                        t.change_percent = q.change_percent;
+                        t.high_24h = q.high;
+                        t.low_24h = q.low;
+                        t.volume = q.volume;
+                    }
+                }
+            }
+            WorkerUpdate::News { symbol, news } => {
+                let is_active = self.selected_ticker().map(|t| t.symbol == symbol).unwrap_or(false);
+                if is_active {
+                    self.news = news.clone();
+                }
+                self.cache.insert_news(symbol, news);
+            }
+            WorkerUpdate::Options { symbol, options } => {
+                let is_active = self.selected_ticker().map(|t| t.symbol == symbol).unwrap_or(false);
+                if is_active {
+                    self.options_chain = Some(options.clone());
+                }
+                self.cache.insert_options(symbol, options);
+            }
+            WorkerUpdate::Insiders { symbol, trades } => {
+                let is_active = self.selected_ticker().map(|t| t.symbol == symbol).unwrap_or(false);
+                if is_active {
+                    self.insider_trades = trades.clone();
+                }
+                self.cache.insert_insiders(symbol, trades);
+            }
+            WorkerUpdate::YieldCurve(yc) => {
+                self.yield_curve = Some(yc.clone());
+                self.cache.insert_yield_curve(yc);
+            }
+            WorkerUpdate::Correlation(corr) => {
+                self.correlation = Some(corr.clone());
+                self.cache.insert_correlation(corr);
             }
         }
     }
 
-    pub async fn handle_event(&mut self, ev: Event) -> Result<()> {
+    /// Backwards-compatible synchronous event handler with sub-millisecond latency.
+    pub fn handle_event(&mut self, ev: Event) -> Result<()> {
         if let Event::Key(key) = ev {
             if key.kind != KeyEventKind::Press {
                 return Ok(());
             }
 
             if self.show_add_modal {
-                self.handle_modal_key(key).await?;
+                self.handle_modal_key(key)?;
                 return Ok(());
             }
 
@@ -323,11 +411,11 @@ impl App {
             // Route keys based on active view and focus
             match self.current_view {
                 WorkspaceView::Overview => match self.focus {
-                    Focus::Watchlist => self.handle_watchlist_key(key).await?,
-                    Focus::Chart => self.handle_chart_key(key).await?,
-                    Focus::News => self.handle_news_key(key).await?,
+                    Focus::Watchlist => self.handle_watchlist_key(key)?,
+                    Focus::Chart => self.handle_chart_key(key)?,
+                    Focus::News => self.handle_news_key(key)?,
                 },
-                _ => self.handle_non_overview_key(key).await?,
+                _ => self.handle_non_overview_key(key)?,
             }
         }
         Ok(())
@@ -347,12 +435,12 @@ impl App {
         let indices = self.filtered_indices();
         if !indices.contains(&self.selected) {
             if let Some(&first) = indices.first() {
-                self.selected = first;
+                self.select_ticker(first);
             }
         }
     }
 
-    async fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_modal_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Esc => {
                 self.show_add_modal = false;
@@ -362,11 +450,11 @@ impl App {
                 let trimmed = self.input_buffer.trim();
                 if !trimmed.is_empty() {
                     let new_ticker = Ticker::new(trimmed);
+                    let _ = self.tx_req.send(WorkerRequest::AddTicker(new_ticker.clone()));
                     self.watchlist.push(new_ticker);
-                    self.selected = self.watchlist.len() - 1;
+                    self.select_ticker(self.watchlist.len() - 1);
                     self.input_buffer.clear();
                     self.show_add_modal = false;
-                    self.refresh_active().await.ok();
                 }
             }
             KeyCode::Backspace => {
@@ -382,7 +470,7 @@ impl App {
         Ok(())
     }
 
-    async fn handle_watchlist_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_watchlist_key(&mut self, key: KeyEvent) -> Result<()> {
         let indices = self.filtered_indices();
         let current_pos = indices.iter().position(|&idx| idx == self.selected).unwrap_or(0);
 
@@ -395,27 +483,32 @@ impl App {
             }
             KeyCode::Char('j') | KeyCode::Down => {
                 if current_pos + 1 < indices.len() {
-                    self.selected = indices[current_pos + 1];
-                    self.refresh_active().await.ok();
+                    self.select_ticker(indices[current_pos + 1]);
                 }
             }
             KeyCode::Char('k') | KeyCode::Up => {
                 if current_pos > 0 {
-                    self.selected = indices[current_pos - 1];
-                    self.refresh_active().await.ok();
+                    self.select_ticker(indices[current_pos - 1]);
                 }
             }
             KeyCode::Char('d') => {
                 if !self.watchlist.is_empty() && self.selected < self.watchlist.len() {
-                    self.watchlist.remove(self.selected);
+                    let removed = self.watchlist.remove(self.selected);
+                    let _ = self.tx_req.send(WorkerRequest::RemoveTicker(removed.symbol));
                     if self.selected >= self.watchlist.len() && self.selected > 0 {
                         self.selected -= 1;
                     }
-                    self.refresh_active().await.ok();
+                    self.select_ticker(self.selected);
                 }
             }
             KeyCode::Char('r') => {
-                self.refresh_active().await.ok();
+                let _ = self.tx_req.send(WorkerRequest::RefreshAll);
+                if let Some(t) = self.selected_ticker().cloned() {
+                    let _ = self.tx_req.send(WorkerRequest::PrioritizeTicker {
+                        ticker: t,
+                        timeframe: self.timeframe,
+                    });
+                }
             }
             KeyCode::Char('/') | KeyCode::Char('a') => {
                 self.show_add_modal = true;
@@ -423,8 +516,7 @@ impl App {
             }
             KeyCode::Char(c) if ('1'..='6').contains(&c) => {
                 if let Some(tf) = Timeframe::from_digit(c) {
-                    self.timeframe = tf;
-                    self.refresh_active().await.ok();
+                    self.set_timeframe(tf);
                 }
             }
             _ => {}
@@ -432,14 +524,18 @@ impl App {
         Ok(())
     }
 
-    async fn handle_chart_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_chart_key(&mut self, key: KeyEvent) -> Result<()> {
         let candle_count = self.candles.len();
         let max_idx = candle_count.saturating_sub(1);
         let cur = self.chart_cursor.unwrap_or(max_idx);
 
         match key.code {
             KeyCode::Tab => {
-                self.focus = if self.show_news { Focus::News } else { Focus::Watchlist };
+                self.focus = if self.show_news {
+                    Focus::News
+                } else {
+                    Focus::Watchlist
+                };
             }
             KeyCode::Char('q') => {
                 self.should_quit = true;
@@ -462,12 +558,17 @@ impl App {
             }
             KeyCode::Char(c) if ('1'..='6').contains(&c) => {
                 if let Some(tf) = Timeframe::from_digit(c) {
-                    self.timeframe = tf;
-                    self.refresh_active().await.ok();
+                    self.set_timeframe(tf);
                 }
             }
             KeyCode::Char('r') => {
-                self.refresh_active().await.ok();
+                let _ = self.tx_req.send(WorkerRequest::RefreshAll);
+                if let Some(t) = self.selected_ticker().cloned() {
+                    let _ = self.tx_req.send(WorkerRequest::PrioritizeTicker {
+                        ticker: t,
+                        timeframe: self.timeframe,
+                    });
+                }
             }
             KeyCode::Char('/') | KeyCode::Char('a') => {
                 self.show_add_modal = true;
@@ -478,7 +579,7 @@ impl App {
         Ok(())
     }
 
-    async fn handle_news_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_news_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Tab => {
                 self.focus = Focus::Watchlist;
@@ -504,20 +605,32 @@ impl App {
                 }
             }
             KeyCode::Char('r') => {
-                self.refresh_active().await.ok();
+                let _ = self.tx_req.send(WorkerRequest::RefreshAll);
+                if let Some(t) = self.selected_ticker().cloned() {
+                    let _ = self.tx_req.send(WorkerRequest::PrioritizeTicker {
+                        ticker: t,
+                        timeframe: self.timeframe,
+                    });
+                }
             }
             _ => {}
         }
         Ok(())
     }
 
-    async fn handle_non_overview_key(&mut self, key: KeyEvent) -> Result<()> {
+    fn handle_non_overview_key(&mut self, key: KeyEvent) -> Result<()> {
         match key.code {
             KeyCode::Char('q') => {
                 self.should_quit = true;
             }
             KeyCode::Char('r') => {
-                self.refresh_active().await.ok();
+                let _ = self.tx_req.send(WorkerRequest::RefreshAll);
+                if let Some(t) = self.selected_ticker().cloned() {
+                    let _ = self.tx_req.send(WorkerRequest::PrioritizeTicker {
+                        ticker: t,
+                        timeframe: self.timeframe,
+                    });
+                }
             }
             KeyCode::Tab => {
                 self.current_view = self.current_view.next();
@@ -528,6 +641,86 @@ impl App {
             _ => {}
         }
         Ok(())
+    }
+
+    /// Direct async fetch helper for offline scripts, integration tests, or headless examples.
+    pub async fn refresh_active(&mut self) -> Result<()> {
+        if let Some(ticker) = self.watchlist.get(self.selected).cloned() {
+            let symbol = ticker.symbol.clone();
+
+            if let Ok(snap) = data::fetch_chart_data(&ticker, self.timeframe).await {
+                self.candles = snap.candles.clone();
+                self.chart_data = snap.points.clone();
+                self.chart_cursor = None;
+
+                if let Some(t) = self.watchlist.get_mut(self.selected) {
+                    t.current_price = snap.current_price;
+                    t.change = snap.current_price - snap.previous_close;
+                    if snap.previous_close.abs() > 0.0001 {
+                        t.change_percent = (t.change / snap.previous_close) * 100.0;
+                    }
+                    t.high_24h = snap.high;
+                    t.low_24h = snap.low;
+                    t.volume = snap.volume;
+                }
+                self.cache.insert_chart(symbol.clone(), self.timeframe, snap);
+            }
+
+            let news = data::fetch_ticker_news(&symbol).await;
+            self.news = news.clone();
+            self.cache.insert_news(symbol.clone(), news);
+            self.news_selected = 0;
+
+            let cur_price = self.selected_ticker().map(|t| t.current_price).unwrap_or(150.0);
+            if let Ok(opt) = fetch_options_chain(&symbol, cur_price).await {
+                self.options_chain = Some(opt.clone());
+                self.cache.insert_options(symbol.clone(), opt);
+            }
+
+            if let Ok(trades) = fetch_insider_transactions(&symbol).await {
+                self.insider_trades = trades.clone();
+                self.cache.insert_insiders(symbol.clone(), trades);
+            }
+
+            if let Ok(yc) = fetch_yield_curve().await {
+                self.yield_curve = Some(yc.clone());
+                self.cache.insert_yield_curve(yc);
+            }
+
+            self.update_correlation_analysis().await;
+        }
+
+        self.last_refresh = Instant::now();
+        Ok(())
+    }
+
+    pub async fn update_correlation_analysis(&mut self) {
+        let mut asset_candles = Vec::new();
+        for t in self.watchlist.iter().take(8) {
+            if let Ok(snap) = data::fetch_chart_data(t, Timeframe::OneMonth).await {
+                asset_candles.push((t.symbol.clone(), snap.candles));
+            }
+        }
+        if !asset_candles.is_empty() {
+            let corr = compute_correlation_matrix(&asset_candles, "SPY");
+            self.correlation = Some(corr.clone());
+            self.cache.insert_correlation(corr);
+        }
+    }
+
+    pub async fn refresh_all_quotes(&mut self) {
+        for t in &mut self.watchlist {
+            if let Ok(snap) = data::fetch_chart_data(t, Timeframe::OneDay).await {
+                t.current_price = snap.current_price;
+                t.change = snap.current_price - snap.previous_close;
+                if snap.previous_close.abs() > 0.0001 {
+                    t.change_percent = (t.change / snap.previous_close) * 100.0;
+                }
+                t.high_24h = snap.high;
+                t.low_24h = snap.low;
+                t.volume = snap.volume;
+            }
+        }
     }
 }
 

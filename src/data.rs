@@ -93,6 +93,7 @@ struct YahooError {
     description: String,
 }
 
+#[derive(Debug, Clone, PartialEq)]
 pub struct MarketSnapshot {
     pub candles: Vec<Candle>,
     pub points: Vec<(f64, f64)>, // Densely interpolated continuous solid line points
@@ -305,7 +306,7 @@ pub fn interpolate_candles_to_dense_line(candles: &[Candle]) -> Vec<(f64, f64)> 
     dense_points
 }
 
-fn fallback_synthetic(ticker: &Ticker, tf: Timeframe) -> Result<MarketSnapshot> {
+pub fn fallback_synthetic(ticker: &Ticker, tf: Timeframe) -> Result<MarketSnapshot> {
     let now = Utc::now().timestamp();
     let (count, step_sec, base_price, volatility) = match (ticker.symbol.as_str(), tf) {
         (s, _) if s.starts_with("BTC") => (50, 300, 68_500.0, 350.0),

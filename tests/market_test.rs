@@ -1,14 +1,17 @@
 // tests/market_test.rs
-//! Comprehensive test suite for options max pain, correlation, insider trades, and yield curve.
+//! Comprehensive test suite for options max pain, correlation, insider trades, yield curve, and pre-cache.
 
 use market_tui::{
-    app::WorkspaceView,
+    app::{App, WorkspaceView},
+    cache::{MarketCache, QuoteUpdate, WorkerUpdate},
     correlation::pearson_correlation,
-    data::{interpolate_candles_to_dense_line, Candle},
+    data::{interpolate_candles_to_dense_line, Candle, MarketSnapshot},
     options::{calculate_max_pain, OptionContract},
     ticker::{AssetCategory, Ticker},
+    timeframe::Timeframe,
     yield_curve::calculate_estrella_mishkin_recession_prob,
 };
+use std::collections::HashMap;
 
 #[test]
 fn test_workspace_view_cycling() {
@@ -86,4 +89,65 @@ fn test_dense_line_interpolation() {
     ];
     let points = interpolate_candles_to_dense_line(&candles);
     assert!(points.len() > 2);
+}
+
+#[test]
+fn test_market_cache_insert_and_lookup() {
+    let mut cache = MarketCache::new();
+    let snap = MarketSnapshot {
+        candles: vec![Candle { timestamp: 100.0, open: 10.0, high: 12.0, low: 9.0, close: 11.0, volume: 5000.0 }],
+        points: vec![(100.0, 11.0)],
+        current_price: 11.0,
+        previous_close: 10.0,
+        high: 12.0,
+        low: 9.0,
+        volume: 5000.0,
+    };
+
+    cache.insert_chart("NVDA".to_string(), Timeframe::OneDay, snap.clone());
+
+    let cached = cache.get_chart("NVDA", Timeframe::OneDay);
+    assert!(cached.is_some());
+    assert_eq!(cached.unwrap().current_price, 11.0);
+    assert!(cache.get_chart("NVDA", Timeframe::OneWeek).is_none());
+}
+
+#[test]
+fn test_app_pre_cache_instant_ticker_switch() {
+    let mut app = App::new();
+    assert_eq!(app.selected, 0);
+
+    // Insert cached data for AAPL
+    let aapl_snap = MarketSnapshot {
+        candles: vec![Candle { timestamp: 200.0, open: 220.0, high: 225.0, low: 219.0, close: 224.0, volume: 80000.0 }],
+        points: vec![(200.0, 224.0)],
+        current_price: 224.0,
+        previous_close: 220.0,
+        high: 225.0,
+        low: 219.0,
+        volume: 80000.0,
+    };
+    app.cache.insert_chart("AAPL".to_string(), Timeframe::OneDay, aapl_snap);
+
+    // Instant switch to index 1 (AAPL) without blocking
+    app.select_ticker(1);
+    assert_eq!(app.selected, 1);
+    assert_eq!(app.candles.len(), 1);
+    assert_eq!(app.candles[0].close, 224.0);
+
+    // Apply live quotes update
+    let mut quotes = HashMap::new();
+    quotes.insert("AAPL".to_string(), QuoteUpdate {
+        current_price: 226.5,
+        previous_close: 220.0,
+        change: 6.5,
+        change_percent: 2.95,
+        high: 227.0,
+        low: 219.0,
+        volume: 120000.0,
+    });
+    app.apply_update(WorkerUpdate::Quotes(quotes));
+
+    assert_eq!(app.watchlist[1].current_price, 226.5);
+    assert_eq!(app.watchlist[1].change, 6.5);
 }

@@ -1,5 +1,6 @@
 // src/lib.rs
 pub mod app;
+pub mod cache;
 pub mod correlation;
 pub mod data;
 pub mod insider;

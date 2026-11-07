@@ -1,7 +1,7 @@
 // src/timeframe.rs
 //! Timeframe definitions and Yahoo Finance query parameters.
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Timeframe {
     OneDay,
     OneWeek,

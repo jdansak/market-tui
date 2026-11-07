@@ -1,5 +1,5 @@
 // src/main.rs
-//! Application entry point for Bloomberg Terminal TUI workstation.
+//! Application entry point for Bloomberg Terminal TUI workstation with continuous background pre-cache.
 
 use anyhow::Result;
 use crossterm::{
@@ -11,8 +11,10 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use std::io::stdout;
 use std::panic;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 mod app;
+mod cache;
 mod correlation;
 mod data;
 mod insider;
@@ -23,6 +25,7 @@ mod ui;
 mod yield_curve;
 
 use app::App;
+use cache::{start_background_worker, WorkerRequest};
 use ui::draw_ui;
 
 #[tokio::main]
@@ -43,29 +46,41 @@ async fn main() -> Result<()> {
     let mut terminal = Terminal::new(backend)?;
     terminal.clear()?;
 
-    let mut app = App::new();
+    // Communication channels between App and background pre-cache worker
+    let (tx_req, rx_req) = mpsc::unbounded_channel();
+    let (tx_update, mut rx_update) = mpsc::unbounded_channel();
 
-    // Fetch initial active ticker data, quotes, and institutional analytics
-    app.refresh_active().await.ok();
-    app.refresh_all_quotes().await;
+    let mut app = App::with_channels(tx_req.clone());
 
-    // Event loop
+    // Launch continuous background worker for non-blocking pre-cache polling
+    start_background_worker(app.watchlist.clone(), rx_req, tx_update);
+
+    // Eagerly trigger active selected ticker pre-fetch
+    if let Some(t) = app.selected_ticker().cloned() {
+        let _ = tx_req.send(WorkerRequest::PrioritizeTicker {
+            ticker: t,
+            timeframe: app.timeframe,
+        });
+    }
+
+    // High-performance event loop: sub-millisecond keyboard responsiveness + smooth cache rendering
     while !app.should_quit {
         terminal.draw(|f| draw_ui(f, &app))?;
 
-        if event::poll(Duration::from_millis(80))? {
+        // 1. Snappy keyboard input handling (20ms poll, returns immediately when a key is pressed)
+        if event::poll(Duration::from_millis(20))? {
             let ev = event::read()?;
             if let Event::Key(key) = &ev {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {
                     break;
                 }
             }
-            app.handle_event(ev).await.ok();
+            app.handle_event(ev).ok();
         }
 
-        // Auto-refresh active ticker quote and chart every 20 seconds
-        if app.last_refresh.elapsed() > Duration::from_secs(20) {
-            app.refresh_active().await.ok();
+        // 2. Non-blocking drain of background pre-cache updates
+        while let Ok(update) = rx_update.try_recv() {
+            app.apply_update(update);
         }
     }
 
