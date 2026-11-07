@@ -85,7 +85,7 @@ impl Timeframe {
         match self {
             Timeframe::OneDay => "5m",
             Timeframe::OneWeek => "15m",
-            Timeframe::OneMonth => "1d",
+            Timeframe::OneMonth => "1h",
             Timeframe::SixMonths => "1d",
             Timeframe::YTD => "1d",
             Timeframe::All => "1wk",

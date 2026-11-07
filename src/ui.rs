@@ -42,7 +42,6 @@ pub mod palette {
 pub fn draw_ui(f: &mut Frame, app: &App) {
     let area = f.area();
 
-    // Vertical layout: Top Navigation Bar, Main Workspace Content, Bottom Help Bar
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -412,12 +411,17 @@ struct CandlestickWidget<'a> {
 
 impl<'a> Widget for CandlestickWidget<'a> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        if area.width < 10 || area.height < 4 || self.candles.is_empty() {
+        if area.width < 12 || area.height < 4 || self.candles.is_empty() {
             return;
         }
 
         let chart_height = (area.height.saturating_sub(2)) as usize;
         let chart_width = area.width.saturating_sub(10) as usize;
+
+        let candle_count = self.candles.len();
+        if candle_count == 0 || chart_width == 0 {
+            return;
+        }
 
         let mut min_price = f64::MAX;
         let mut max_price = f64::MIN;
@@ -444,13 +448,28 @@ impl<'a> Widget for CandlestickWidget<'a> {
         buf.set_string(area.x + area.width - 9, area.y + (chart_height as u16 / 2), &mid_label, Style::default().fg(palette::TEXT_MUTED));
         buf.set_string(area.x + area.width - 9, area.y + chart_height as u16 - 1, &bot_label, Style::default().fg(palette::TEXT_MUTED));
 
-        let candle_stride = 2;
-        let max_visible_candles = chart_width / candle_stride;
-        let (visible_candles, offset) = if self.candles.len() > max_visible_candles {
-            let start = self.candles.len() - max_visible_candles;
+        // When many candles exist, fit at most chart_width candles
+        let max_fit = chart_width;
+        let (visible_candles, offset) = if candle_count > max_fit {
+            let start = candle_count - max_fit;
             (&self.candles[start..], start)
         } else {
             (self.candles, 0)
+        };
+
+        let visible_count = visible_candles.len();
+        if visible_count == 0 {
+            return;
+        }
+
+        // Determine dynamic candle width and spacing so the candles always span 100% of chart_width
+        let avg_space = chart_width as f64 / visible_count as f64;
+        let body_width = if avg_space >= 4.0 {
+            3
+        } else if avg_space >= 2.5 {
+            2
+        } else {
+            1
         };
 
         let active_cur_global = self.cursor_idx.unwrap_or(self.candles.len().saturating_sub(1));
@@ -459,7 +478,14 @@ impl<'a> Widget for CandlestickWidget<'a> {
             let global_idx = offset + idx;
             let is_inspected = global_idx == active_cur_global;
 
-            let col = area.x + (idx * candle_stride) as u16;
+            // Evenly distribute columns across the full chart_width
+            let col = if visible_count > 1 {
+                let span = (chart_width.saturating_sub(body_width)) as f64;
+                area.x + ((idx as f64 / (visible_count - 1) as f64) * span).round() as u16
+            } else {
+                area.x + (chart_width / 2) as u16
+            };
+
             if col >= area.x + chart_width as u16 {
                 break;
             }
@@ -484,30 +510,44 @@ impl<'a> Widget for CandlestickWidget<'a> {
             let body_top_row = ((max_price - body_top_price) / price_range * (chart_height - 1) as f64).round() as usize;
             let body_bot_row = ((max_price - body_bot_price) / price_range * (chart_height - 1) as f64).round() as usize;
 
+            let wick_col = col + (body_width as u16 / 2);
+
             if is_inspected {
                 for r in 0..chart_height {
                     let cell_y = area.y + r as u16;
-                    buf.set_string(col, cell_y, "┊", Style::default().fg(Color::Rgb(40, 60, 85)));
+                    buf.set_string(wick_col, cell_y, "┊", Style::default().fg(Color::Rgb(40, 60, 85)));
                 }
             }
 
             for r in high_row..body_top_row {
                 let cell_y = area.y + r as u16;
                 if cell_y < area.y + chart_height as u16 {
-                    buf.set_string(col, cell_y, "│", style);
+                    buf.set_string(wick_col, cell_y, "│", style);
                 }
             }
+
+            let body_char = match body_width {
+                1 => "█",
+                2 => "██",
+                _ => "███",
+            };
+
+            let doji_char = match body_width {
+                1 => "┼",
+                2 => "┼┼",
+                _ => "┼┼┼",
+            };
 
             if body_top_row == body_bot_row {
                 let cell_y = area.y + body_top_row as u16;
                 if cell_y < area.y + chart_height as u16 {
-                    buf.set_string(col, cell_y, "┼", style);
+                    buf.set_string(col, cell_y, doji_char, style);
                 }
             } else {
                 for r in body_top_row..=body_bot_row {
                     let cell_y = area.y + r as u16;
                     if cell_y < area.y + chart_height as u16 {
-                        buf.set_string(col, cell_y, "█", style);
+                        buf.set_string(col, cell_y, body_char, style);
                     }
                 }
             }
@@ -515,13 +555,13 @@ impl<'a> Widget for CandlestickWidget<'a> {
             for r in (body_bot_row + 1)..=low_row {
                 let cell_y = area.y + r as u16;
                 if cell_y < area.y + chart_height as u16 {
-                    buf.set_string(col, cell_y, "│", style);
+                    buf.set_string(wick_col, cell_y, "│", style);
                 }
             }
 
             let vol_row = area.y + chart_height as u16;
             let vol_frac = (candle.volume / max_vol).clamp(0.0, 1.0);
-            let vol_char = match (vol_frac * 8.0).round() as u8 {
+            let single_vol = match (vol_frac * 8.0).round() as u8 {
                 0 => " ",
                 1 => " ",
                 2 => "▂",
@@ -532,11 +572,12 @@ impl<'a> Widget for CandlestickWidget<'a> {
                 7 => "▇",
                 _ => "█",
             };
-            buf.set_string(col, vol_row, vol_char, Style::default().fg(candle_color));
+            let vol_str = single_vol.repeat(body_width);
+            buf.set_string(col, vol_row, &vol_str, Style::default().fg(candle_color));
 
             if is_inspected {
                 let marker_row = area.y + area.height - 1;
-                buf.set_string(col, marker_row, "▲", Style::default().fg(palette::ACTIVE_BORDER).add_modifier(Modifier::BOLD));
+                buf.set_string(wick_col, marker_row, "▲", Style::default().fg(palette::ACTIVE_BORDER).add_modifier(Modifier::BOLD));
             }
         }
 
