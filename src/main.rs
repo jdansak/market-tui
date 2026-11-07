@@ -1,5 +1,5 @@
 // src/main.rs
-//! Application entry point for market_tui.
+//! Application entry point for Bloomberg Terminal TUI workstation.
 
 use anyhow::Result;
 use crossterm::{
@@ -13,10 +13,14 @@ use std::panic;
 use std::time::Duration;
 
 mod app;
+mod correlation;
 mod data;
+mod insider;
+mod options;
 mod ticker;
 mod timeframe;
 mod ui;
+mod yield_curve;
 
 use app::App;
 use ui::draw_ui;
@@ -41,7 +45,7 @@ async fn main() -> Result<()> {
 
     let mut app = App::new();
 
-    // Fetch initial active ticker data and quotes
+    // Fetch initial active ticker data, quotes, and institutional analytics
     app.refresh_active().await.ok();
     app.refresh_all_quotes().await;
 
@@ -49,7 +53,7 @@ async fn main() -> Result<()> {
     while !app.should_quit {
         terminal.draw(|f| draw_ui(f, &app))?;
 
-        if event::poll(Duration::from_millis(100))? {
+        if event::poll(Duration::from_millis(80))? {
             let ev = event::read()?;
             if let Event::Key(key) = &ev {
                 if key.modifiers.contains(KeyModifiers::CONTROL) && key.code == KeyCode::Char('c') {

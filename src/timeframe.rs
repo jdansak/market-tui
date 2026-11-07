@@ -44,6 +44,7 @@ impl Timeframe {
         }
     }
 
+    #[allow(dead_code)]
     pub fn next(self) -> Self {
         use Timeframe::*;
         match self {
@@ -56,6 +57,7 @@ impl Timeframe {
         }
     }
 
+    #[allow(dead_code)]
     pub fn prev(self) -> Self {
         use Timeframe::*;
         match self {
