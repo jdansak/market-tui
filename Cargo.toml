@@ -15,3 +15,9 @@ serde_json = "1.0"
 chrono = { version = "0.4", features = ["serde"] }
 anyhow = "1.0"
 futures = "0.3"
+
+[[example]]
+name = "export_frames"
+path = "examples/export_frames.rs"
+
+
