@@ -17,6 +17,7 @@ mod app;
 mod cache;
 mod correlation;
 mod data;
+mod db;
 mod insider;
 mod options;
 mod ticker;
@@ -50,7 +51,8 @@ async fn main() -> Result<()> {
     let (tx_req, rx_req) = mpsc::unbounded_channel();
     let (tx_update, mut rx_update) = mpsc::unbounded_channel();
 
-    let mut app = App::with_channels(tx_req.clone());
+    let db = db::TickerDb::open_default().ok();
+    let mut app = App::with_db_and_channels(db, tx_req.clone());
 
     // Launch continuous background worker for non-blocking pre-cache polling
     start_background_worker(app.watchlist.clone(), rx_req, tx_update);

@@ -3,6 +3,7 @@ pub mod app;
 pub mod cache;
 pub mod correlation;
 pub mod data;
+pub mod db;
 pub mod insider;
 pub mod options;
 pub mod ticker;

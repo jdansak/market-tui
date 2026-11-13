@@ -3,6 +3,7 @@
 
 use market_tui::{
     app::{App, WorkspaceView},
+    db::TickerDb,
     cache::{MarketCache, QuoteUpdate, WorkerUpdate},
     correlation::pearson_correlation,
     data::{interpolate_candles_to_dense_line, Candle, MarketSnapshot},
@@ -150,4 +151,77 @@ fn test_app_pre_cache_instant_ticker_switch() {
 
     assert_eq!(app.watchlist[1].current_price, 226.5);
     assert_eq!(app.watchlist[1].change, 6.5);
+}
+
+#[test]
+fn test_sqlite_db_seed_add_remove_and_reopen() {
+    let db_path = std::env::temp_dir().join(format!(
+        "market_tui_test_{}_{}.db",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let _ = std::fs::remove_file(&db_path);
+
+    let defaults = vec![Ticker::new("NVDA"), Ticker::new("BTC")];
+    {
+        let db = TickerDb::open_path(&db_path).expect("open db");
+        let loaded = db.load_or_seed(&defaults).expect("seed defaults");
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].symbol, "NVDA");
+        assert_eq!(loaded[1].symbol, "BTC-USD");
+
+        db.add_ticker(&Ticker::new("AMD")).expect("add AMD");
+        assert!(db.remove_ticker("NVDA").expect("remove NVDA"));
+    }
+
+    // Reopen from disk and verify persistence without re-seeding NVDA
+    {
+        let db = TickerDb::open_path(&db_path).expect("reopen db");
+        let loaded = db.load_or_seed(&defaults).expect("load persisted");
+        let symbols: Vec<&str> = loaded.iter().map(|t| t.symbol.as_str()).collect();
+        assert_eq!(symbols, vec!["BTC-USD", "AMD"]);
+
+        // Removing all tickers should stay empty on next load (not re-seed)
+        assert!(db.remove_ticker("BTC-USD").unwrap());
+        assert!(db.remove_ticker("AMD").unwrap());
+        let empty = db.load_or_seed(&defaults).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    let _ = std::fs::remove_file(&db_path);
+}
+
+#[test]
+fn test_app_with_sqlite_db_persists_add_and_delete() {
+    use crossterm::event::{Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+    use tokio::sync::mpsc;
+
+    let db = TickerDb::open_in_memory().expect("in-memory db");
+    let (tx, _rx) = mpsc::unbounded_channel();
+    let mut app = App::with_db_and_channels(Some(db), tx);
+    let initial_len = app.watchlist.len();
+    assert!(initial_len >= 5);
+
+    // Open add modal, type PLTR, press Enter
+    let press = |code| Event::Key(KeyEvent::new_with_kind(code, KeyModifiers::NONE, KeyEventKind::Press));
+    app.handle_event(press(KeyCode::Char('a'))).unwrap();
+    for ch in "PLTR".chars() {
+        app.handle_event(press(KeyCode::Char(ch))).unwrap();
+    }
+    app.handle_event(press(KeyCode::Enter)).unwrap();
+
+    assert_eq!(app.watchlist.len(), initial_len + 1);
+    assert_eq!(app.selected_ticker().unwrap().symbol, "PLTR");
+
+    let persisted = app.db.as_ref().unwrap().list_tickers().unwrap();
+    assert!(persisted.iter().any(|t| t.symbol == "PLTR"));
+
+    // Delete PLTR via 'd'
+    app.handle_event(press(KeyCode::Char('d'))).unwrap();
+    assert_eq!(app.watchlist.len(), initial_len);
+    let persisted_after = app.db.as_ref().unwrap().list_tickers().unwrap();
+    assert!(!persisted_after.iter().any(|t| t.symbol == "PLTR"));
 }

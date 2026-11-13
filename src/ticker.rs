@@ -11,6 +11,16 @@ pub enum AssetCategory {
 }
 
 impl AssetCategory {
+    pub fn from_label(s: &str) -> Self {
+        match s.trim().to_uppercase().as_str() {
+            "CRYPTO" => AssetCategory::Crypto,
+            "BOND" => AssetCategory::Bond,
+            "FOREX" => AssetCategory::Forex,
+            "COMMODITY" => AssetCategory::Commodity,
+            _ => AssetCategory::Stock,
+        }
+    }
+
     pub fn label(self) -> &'static str {
         match self {
             AssetCategory::Stock => "STOCK",
@@ -90,6 +100,20 @@ impl Ticker {
 
         Self {
             symbol: full_symbol,
+            display_name,
+            category,
+            current_price: 0.0,
+            change: 0.0,
+            change_percent: 0.0,
+            high_24h: 0.0,
+            low_24h: 0.0,
+            volume: 0.0,
+        }
+    }
+
+    pub fn from_stored(symbol: String, display_name: String, category: AssetCategory) -> Self {
+        Self {
+            symbol,
             display_name,
             category,
             current_price: 0.0,

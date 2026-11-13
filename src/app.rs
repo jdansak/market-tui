@@ -5,6 +5,7 @@ use crate::{
     cache::{MarketCache, WorkerRequest, WorkerUpdate},
     correlation::{compute_correlation_matrix, CorrelationAnalysis},
     data::{self, Candle, NewsItem},
+    db::TickerDb,
     insider::{fetch_insider_transactions, InsiderTransaction},
     options::{fetch_options_chain, OptionsChain},
     ticker::{AssetCategory, Ticker},
@@ -114,6 +115,7 @@ pub struct App {
 
     // High-Performance In-Memory Pre-Cache & Worker Channel
     pub cache: MarketCache,
+    pub db: Option<TickerDb>,
     pub tx_req: mpsc::UnboundedSender<WorkerRequest>,
 }
 
@@ -169,6 +171,7 @@ impl Default for App {
             insider_trades: Vec::new(),
             yield_curve: None,
             cache,
+            db: None,
             tx_req: tx,
         }
     }
@@ -181,8 +184,31 @@ impl App {
     }
 
     pub fn with_channels(tx_req: mpsc::UnboundedSender<WorkerRequest>) -> Self {
+        Self::with_db_and_channels(None, tx_req)
+    }
+
+    pub fn with_db_and_channels(
+        db: Option<TickerDb>,
+        tx_req: mpsc::UnboundedSender<WorkerRequest>,
+    ) -> Self {
         let mut app = Self::default();
         app.tx_req = tx_req;
+        if let Some(ref database) = db {
+            if let Ok(stored) = database.load_or_seed(&app.watchlist) {
+                app.watchlist = stored;
+                app.selected = 0;
+                if let Some(first) = app.watchlist.first().cloned() {
+                    let snap = data::fallback_synthetic(&first, app.timeframe).unwrap();
+                    app.candles = snap.candles.clone();
+                    app.chart_data = snap.points.clone();
+                    app.cache.insert_chart(first.symbol, app.timeframe, snap);
+                } else {
+                    app.candles.clear();
+                    app.chart_data.clear();
+                }
+            }
+        }
+        app.db = db;
         app
     }
 
@@ -450,9 +476,16 @@ impl App {
                 let trimmed = self.input_buffer.trim();
                 if !trimmed.is_empty() {
                     let new_ticker = Ticker::new(trimmed);
-                    let _ = self.tx_req.send(WorkerRequest::AddTicker(new_ticker.clone()));
-                    self.watchlist.push(new_ticker);
-                    self.select_ticker(self.watchlist.len() - 1);
+                    if let Some(existing_idx) = self.watchlist.iter().position(|t| t.symbol == new_ticker.symbol) {
+                        self.select_ticker(existing_idx);
+                    } else {
+                        if let Some(db) = &self.db {
+                            let _ = db.add_ticker(&new_ticker);
+                        }
+                        let _ = self.tx_req.send(WorkerRequest::AddTicker(new_ticker.clone()));
+                        self.watchlist.push(new_ticker);
+                        self.select_ticker(self.watchlist.len() - 1);
+                    }
                     self.input_buffer.clear();
                     self.show_add_modal = false;
                 }
@@ -494,11 +527,19 @@ impl App {
             KeyCode::Char('d') => {
                 if !self.watchlist.is_empty() && self.selected < self.watchlist.len() {
                     let removed = self.watchlist.remove(self.selected);
+                    if let Some(db) = &self.db {
+                        let _ = db.remove_ticker(&removed.symbol);
+                    }
                     let _ = self.tx_req.send(WorkerRequest::RemoveTicker(removed.symbol));
                     if self.selected >= self.watchlist.len() && self.selected > 0 {
                         self.selected -= 1;
                     }
-                    self.select_ticker(self.selected);
+                    if !self.watchlist.is_empty() {
+                        self.select_ticker(self.selected);
+                    } else {
+                        self.candles.clear();
+                        self.chart_data.clear();
+                    }
                 }
             }
             KeyCode::Char('r') => {
